@@ -71,6 +71,32 @@ ARI_PASSWORD = os.environ.get(
 )
 
 
+REQUIRED_LEAD_FIELDS = [
+    "name",
+    "intent",
+    "area",
+    "property_type",
+    "budget_aed",
+    "timeline",
+    "follow_up",
+]
+
+
+def lead_missing_fields(lead):
+    missing = []
+
+    for field in REQUIRED_LEAD_FIELDS:
+        value = lead.get(field)
+
+        if value is None:
+            missing.append(field)
+            continue
+
+        if isinstance(value, str) and not value.strip():
+            missing.append(field)
+
+    return missing
+
 # ============================================================
 # PYDANTIC MODELS
 # ============================================================
@@ -754,96 +780,125 @@ def get_all_leads():
 # ============================================================
 
 @app.post("/api/call/end")
-def end_call(
-    req: EndCallRequest
-):
+def end_call(req: EndCallRequest):
 
     leads = load_leads()
 
-    channel = None
+    lead = leads.get(req.call_id)
 
-    try:
-
-        channel = (
-            find_active_channel_for_call(
-                req.call_id
-            )
+    if not lead:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "ended": False,
+                "reason": "lead_not_found",
+                "instruction":
+                    "Do not end the call. Continue the conversation and save the lead first."
+            }
         )
 
-    except Exception as e:
+    # --------------------------------------------------
+    # CUSTOMER-REQUESTED TERMINATION ALWAYS WINS
+    # --------------------------------------------------
 
+    immediate_end_reasons = {
+        "customer_requested",
+        "wrong_number",
+        "do_not_call",
+        "abusive"
+    }
+
+    if req.reason not in immediate_end_reasons:
+
+        missing = lead_missing_fields(lead)
+
+        if missing:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "ended": False,
+                    "reason": "qualification_incomplete",
+                    "missing_fields": missing,
+                    "instruction":
+                        "Do not say goodbye yet. Continue naturally and collect the missing information."
+                }
+            )
+
+        if lead.get("status") not in {
+            "qualified",
+            "completed"
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "ended": False,
+                    "reason": "lead_not_qualified",
+                    "instruction":
+                        "Save the complete lead with status qualified before ending the call."
+                }
+            )
+
+    # --------------------------------------------------
+    # FIND EXACT/SAFE ASTERISK CHANNEL
+    # --------------------------------------------------
+
+    try:
+        channel = find_active_channel_for_call(
+            req.call_id
+        )
+    except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=str(e)
         )
 
     if not channel:
-
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Could not uniquely identify "
-                "the active GSM channel. "
-                "Automatic hangup was NOT performed."
-            )
+            detail={
+                "ended": False,
+                "reason": "channel_not_identified",
+                "instruction":
+                    "The backend could not safely identify this call, so no channel was terminated."
+            }
         )
 
-    channel_id = channel.get(
-        "id"
-    )
+    channel_id = channel.get("id")
+    channel_name = channel.get("name")
 
-    channel_name = channel.get(
-        "name"
-    )
+    # Give the final spoken goodbye time to reach GSM.
+    time.sleep(2.0)
 
     try:
-
-        hangup_channel(
-            channel_id
-        )
-
+        hangup_channel(channel_id)
     except Exception as e:
-
         raise HTTPException(
             status_code=500,
             detail=str(e)
         )
 
-    if req.call_id in leads:
+    lead["status"] = (
+        "completed"
+        if req.reason == "qualification_complete"
+        else lead.get("status", "in_progress")
+    )
 
-        leads[
-            req.call_id
-        ][
-            "status"
-        ] = "completed"
+    lead["end_reason"] = req.reason
+    lead["ended_at"] = int(time.time())
+    lead["asterisk_channel_id"] = channel_id
+    lead["asterisk_channel_name"] = channel_name
 
-        leads[
-            req.call_id
-        ][
-            "end_reason"
-        ] = req.reason
-
-        leads[
-            req.call_id
-        ][
-            "ended_at"
-        ] = int(
-            time.time()
-        )
-
-        save_leads(
-            leads
-        )
+    leads[req.call_id] = lead
+    save_leads(leads)
 
     return {
         "ok": True,
         "ended": True,
         "call_id": req.call_id,
+        "reason": req.reason,
         "channel_id": channel_id,
-        "channel_name": channel_name,
-        "reason": req.reason
+        "channel_name": channel_name
     }
-
 
 # ============================================================
 # AGENT SETTINGS
