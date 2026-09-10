@@ -1,0 +1,923 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+import subprocess
+import re
+from pathlib import Path
+
+app = FastAPI(title="AVR Control")
+
+AVR_INFRA = "/root/avr-infra"
+COMPOSE = "/root/avr-infra/docker-compose-weeam.yml"
+ENV_FILE = Path("/root/avr-infra/.env")
+
+
+# ---------------------------------------------------------
+# MODELS
+# ---------------------------------------------------------
+
+class CallRequest(BaseModel):
+    number: str
+
+
+class AgentSettings(BaseModel):
+    model: str
+    voice: str
+    turn_detection: str
+    max_tokens: int
+    instructions: str
+
+
+# ---------------------------------------------------------
+# COMMAND RUNNER
+# ---------------------------------------------------------
+
+def run(cmd, cwd=None, timeout=30):
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout
+    )
+
+    return {
+        "code": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip()
+    }
+
+
+def container_status(name):
+    result = run([
+        "docker", "inspect",
+        "-f", "{{.State.Status}}",
+        name
+    ])
+
+    if result["code"] != 0:
+        return "missing"
+
+    return result["stdout"]
+
+
+# ---------------------------------------------------------
+# ENV FUNCTIONS
+# ---------------------------------------------------------
+
+def read_env():
+    values = {}
+
+    if not ENV_FILE.exists():
+        return values
+
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        values[key.strip()] = value
+
+    return values
+
+
+def update_env_values(updates):
+    if not ENV_FILE.exists():
+        raise RuntimeError(".env file not found")
+
+    original_lines = ENV_FILE.read_text().splitlines()
+    new_lines = []
+    updated = set()
+
+    for line in original_lines:
+        stripped = line.strip()
+
+        if "=" in stripped and not stripped.startswith("#"):
+            key = stripped.split("=", 1)[0].strip()
+
+            if key in updates:
+                value = str(updates[key])
+
+                # keep env values single-line
+                value = value.replace("\r", " ").replace("\n", " ")
+
+                new_lines.append(f"{key}={value}")
+                updated.add(key)
+                continue
+
+        new_lines.append(line)
+
+    for key, value in updates.items():
+        if key not in updated:
+            value = str(value).replace("\r", " ").replace("\n", " ")
+            new_lines.append(f"{key}={value}")
+
+    ENV_FILE.write_text("\n".join(new_lines) + "\n")
+
+
+# ---------------------------------------------------------
+# STATUS
+# ---------------------------------------------------------
+
+@app.get("/api/status")
+def status():
+    ast = run(["asterisk", "-rx", "core show version"])
+
+    return {
+        "asterisk": {
+            "online": ast["code"] == 0,
+            "version": ast["stdout"]
+        },
+        "avr_core": container_status("avr-core"),
+        "avr_sts_openai": container_status("avr-sts-openai")
+    }
+
+
+# ---------------------------------------------------------
+# CALL
+# ---------------------------------------------------------
+
+@app.post("/api/call")
+def call(req: CallRequest):
+    number = req.number.strip()
+
+    if not re.fullmatch(r"00[0-9]{8,16}", number):
+        raise HTTPException(
+            status_code=400,
+            detail="Use international format starting with 00"
+        )
+
+    dial = f"PJSIP/7{number}@4001"
+
+    asterisk_cmd = (
+        f"channel originate {dial} "
+        f"extension s@avr-ai-test"
+    )
+
+    result = run([
+        "asterisk",
+        "-rx",
+        asterisk_cmd
+    ])
+
+    if result["code"] != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=result["stderr"] or result["stdout"]
+        )
+
+    return {
+        "ok": True,
+        "number": number,
+        "dial": dial,
+        "command": asterisk_cmd,
+        "result": result["stdout"]
+    }
+
+
+# ---------------------------------------------------------
+# AGENT SETTINGS
+# ---------------------------------------------------------
+
+@app.get("/api/settings")
+def get_settings():
+    env = read_env()
+
+    return {
+        "model": env.get("OPENAI_MODEL", "gpt-realtime-2"),
+        "voice": env.get("OPENAI_VOICE", "alloy"),
+        "turn_detection": env.get(
+            "OPENAI_TURN_DETECTION",
+            "server_vad"
+        ),
+        "max_tokens": int(
+            env.get("OPENAI_MAX_TOKENS", "200")
+        ),
+        "instructions": env.get(
+            "OPENAI_INSTRUCTIONS",
+            ""
+        )
+    }
+
+
+@app.post("/api/settings")
+def save_settings(settings: AgentSettings):
+    if settings.max_tokens < 50 or settings.max_tokens > 4096:
+        raise HTTPException(
+            status_code=400,
+            detail="max_tokens must be between 50 and 4096"
+        )
+
+    if not settings.model.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Model cannot be empty"
+        )
+
+    if not settings.voice.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Voice cannot be empty"
+        )
+
+    if not settings.instructions.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Instructions cannot be empty"
+        )
+
+    update_env_values({
+        "OPENAI_MODEL": settings.model.strip(),
+        "OPENAI_VOICE": settings.voice.strip(),
+        "OPENAI_TURN_DETECTION": settings.turn_detection.strip(),
+        "OPENAI_MAX_TOKENS": settings.max_tokens,
+        "OPENAI_INSTRUCTIONS": settings.instructions.strip()
+    })
+
+    # Recreate only OpenAI STS so new env gets loaded.
+    result = run([
+        "docker", "compose",
+        "-f", COMPOSE,
+        "up",
+        "-d",
+        "--force-recreate",
+        "avr-sts-openai"
+    ], cwd=AVR_INFRA, timeout=120)
+
+    if result["code"] != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=result["stderr"] or result["stdout"]
+        )
+
+    return {
+        "ok": True,
+        "message": "Agent settings saved and OpenAI STS restarted"
+    }
+
+
+# ---------------------------------------------------------
+# RESTART
+# ---------------------------------------------------------
+
+@app.post("/api/restart-ai")
+def restart_ai():
+    result = run([
+        "docker", "compose",
+        "-f", COMPOSE,
+        "restart",
+        "avr-core",
+        "avr-sts-openai"
+    ], cwd=AVR_INFRA, timeout=120)
+
+    return result
+
+
+# ---------------------------------------------------------
+# LOGS
+# ---------------------------------------------------------
+
+@app.get("/api/logs/{service}")
+def logs(service: str):
+    allowed = {
+        "core": "avr-core",
+        "openai": "avr-sts-openai"
+    }
+
+    if service not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid service"
+        )
+
+    result = run([
+        "docker",
+        "logs",
+        "--tail",
+        "200",
+        allowed[service]
+    ])
+
+    return {
+        "service": service,
+        "logs": (
+            result["stdout"]
+            + "\n"
+            + result["stderr"]
+        ).strip()
+    }
+
+
+# ---------------------------------------------------------
+# WEB UI
+# ---------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return """
+<!DOCTYPE html>
+<html>
+
+<head>
+<meta charset="UTF-8">
+<title>AVR Voice Agent Control</title>
+
+<style>
+
+body {
+    font-family: Arial, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    margin: 0;
+}
+
+.container {
+    max-width: 1100px;
+    margin: 35px auto;
+    padding: 20px;
+}
+
+.card {
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 22px;
+    margin-bottom: 18px;
+}
+
+h1 {
+    margin-bottom: 5px;
+}
+
+h2 {
+    margin-top: 0;
+}
+
+.muted {
+    color: #94a3b8;
+}
+
+.status {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+}
+
+.status-item {
+    background: #0f172a;
+    padding: 14px 18px;
+    border-radius: 8px;
+    min-width: 180px;
+}
+
+.ok {
+    color: #4ade80;
+}
+
+.bad {
+    color: #f87171;
+}
+
+input,
+select,
+textarea {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 12px;
+    margin-top: 5px;
+    margin-bottom: 14px;
+    border-radius: 8px;
+    border: 1px solid #475569;
+    background: #0f172a;
+    color: white;
+}
+
+textarea {
+    min-height: 300px;
+    resize: vertical;
+    line-height: 1.5;
+}
+
+label {
+    font-weight: bold;
+}
+
+button {
+    padding: 12px 18px;
+    margin: 5px 5px 5px 0;
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: bold;
+}
+
+.primary {
+    background: #2563eb;
+    color: white;
+}
+
+.secondary {
+    background: #475569;
+    color: white;
+}
+
+.success {
+    background: #059669;
+    color: white;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+
+pre {
+    background: #020617;
+    padding: 15px;
+    max-height: 450px;
+    overflow: auto;
+    white-space: pre-wrap;
+    border-radius: 8px;
+}
+
+.message {
+    margin-top: 10px;
+    color: #94a3b8;
+}
+
+@media(max-width:700px) {
+    .grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+</style>
+</head>
+
+
+<body>
+
+<div class="container">
+
+<h1>AVR Voice Agent</h1>
+
+<div class="muted">
+Asterisk + AVR Core + OpenAI Realtime
+</div>
+
+
+<div class="card">
+
+<h2>System Status</h2>
+
+<div class="status">
+
+<div class="status-item">
+Asterisk<br>
+<b id="asterisk">Checking...</b>
+</div>
+
+<div class="status-item">
+AVR Core<br>
+<b id="core">Checking...</b>
+</div>
+
+<div class="status-item">
+OpenAI Realtime<br>
+<b id="openai">Checking...</b>
+</div>
+
+</div>
+
+</div>
+
+
+<div class="card">
+
+<h2>Outbound GSM Call</h2>
+
+<input
+    id="number"
+    placeholder="00923041349020"
+>
+
+<button
+    class="primary"
+    onclick="makeCall()">
+    Call
+</button>
+
+<div
+    id="callResult"
+    class="message">
+</div>
+
+</div>
+
+
+<div class="card">
+
+<h2>Agent Configuration</h2>
+
+<div class="grid">
+
+<div>
+<label>OpenAI Model</label>
+
+<input
+    id="model"
+    placeholder="gpt-realtime-2">
+</div>
+
+<div>
+<label>Voice</label>
+
+<input
+    id="voice"
+    placeholder="alloy">
+</div>
+
+<div>
+<label>Turn Detection</label>
+
+<select id="turn_detection">
+<option value="server_vad">
+server_vad
+</option>
+
+<option value="semantic_vad">
+semantic_vad
+</option>
+</select>
+</div>
+
+<div>
+<label>Max Tokens</label>
+
+<input
+    id="max_tokens"
+    type="number"
+    min="50"
+    max="4096">
+</div>
+
+</div>
+
+
+<label>Agent Instructions / System Prompt</label>
+
+<textarea id="instructions"></textarea>
+
+
+<button
+    class="success"
+    onclick="saveSettings()">
+    Save & Apply
+</button>
+
+<span
+    id="settingsResult"
+    class="message">
+</span>
+
+</div>
+
+
+<div class="card">
+
+<h2>AI Runtime</h2>
+
+<button
+    class="secondary"
+    onclick="restartAI()">
+    Restart AI
+</button>
+
+<button
+    class="secondary"
+    onclick="showLogs('core')">
+    AVR Core Logs
+</button>
+
+<button
+    class="secondary"
+    onclick="showLogs('openai')">
+    OpenAI Logs
+</button>
+
+</div>
+
+
+<div class="card">
+
+<h2>Logs</h2>
+
+<pre id="logs">
+Select a log source.
+</pre>
+
+</div>
+
+</div>
+
+
+<script>
+
+
+async function refreshStatus() {
+
+    try {
+
+        const r =
+            await fetch('/api/status');
+
+        const d =
+            await r.json();
+
+
+        document.getElementById(
+            'asterisk'
+        ).innerHTML =
+            d.asterisk.online
+            ? '<span class="ok">● Online</span>'
+            : '<span class="bad">● Offline</span>';
+
+
+        document.getElementById(
+            'core'
+        ).innerHTML =
+            d.avr_core === 'running'
+            ? '<span class="ok">● Running</span>'
+            : '<span class="bad">● '
+              + d.avr_core
+              + '</span>';
+
+
+        document.getElementById(
+            'openai'
+        ).innerHTML =
+            d.avr_sts_openai === 'running'
+            ? '<span class="ok">● Running</span>'
+            : '<span class="bad">● '
+              + d.avr_sts_openai
+              + '</span>';
+
+    } catch(e) {
+
+        console.error(e);
+
+    }
+}
+
+
+
+async function loadSettings() {
+
+    const r =
+        await fetch('/api/settings');
+
+    const d =
+        await r.json();
+
+
+    document.getElementById(
+        'model'
+    ).value = d.model;
+
+
+    document.getElementById(
+        'voice'
+    ).value = d.voice;
+
+
+    document.getElementById(
+        'turn_detection'
+    ).value = d.turn_detection;
+
+
+    document.getElementById(
+        'max_tokens'
+    ).value = d.max_tokens;
+
+
+    document.getElementById(
+        'instructions'
+    ).value = d.instructions;
+}
+
+
+
+async function saveSettings() {
+
+    const result =
+        document.getElementById(
+            'settingsResult'
+        );
+
+    result.innerText =
+        'Saving and restarting OpenAI STS...';
+
+
+    const payload = {
+
+        model:
+            document.getElementById(
+                'model'
+            ).value,
+
+        voice:
+            document.getElementById(
+                'voice'
+            ).value,
+
+        turn_detection:
+            document.getElementById(
+                'turn_detection'
+            ).value,
+
+        max_tokens:
+            Number(
+                document.getElementById(
+                    'max_tokens'
+                ).value
+            ),
+
+        instructions:
+            document.getElementById(
+                'instructions'
+            ).value
+
+    };
+
+
+    const r =
+        await fetch(
+            '/api/settings',
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type':
+                        'application/json'
+                },
+                body:
+                    JSON.stringify(payload)
+            }
+        );
+
+
+    const d =
+        await r.json();
+
+
+    if (!r.ok) {
+
+        result.innerText =
+            'Error: '
+            + (d.detail || 'Save failed');
+
+        return;
+    }
+
+
+    result.innerText =
+        '✓ Settings applied successfully';
+
+
+    setTimeout(
+        refreshStatus,
+        1500
+    );
+
+}
+
+
+
+async function makeCall() {
+
+    const number =
+        document.getElementById(
+            'number'
+        ).value;
+
+
+    const r =
+        await fetch(
+            '/api/call',
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type':
+                        'application/json'
+                },
+                body:
+                    JSON.stringify({
+                        number
+                    })
+            }
+        );
+
+
+    const d =
+        await r.json();
+
+
+    if (!r.ok) {
+
+        document.getElementById(
+            'callResult'
+        ).innerText =
+            'Error: '
+            + (d.detail || 'Call failed');
+
+        return;
+    }
+
+
+    document.getElementById(
+        'callResult'
+    ).innerText =
+        'Calling '
+        + d.number;
+
+}
+
+
+
+async function restartAI() {
+
+    document.getElementById(
+        'logs'
+    ).innerText =
+        'Restarting AVR...';
+
+
+    const r =
+        await fetch(
+            '/api/restart-ai',
+            {
+                method:'POST'
+            }
+        );
+
+
+    const d =
+        await r.json();
+
+
+    document.getElementById(
+        'logs'
+    ).innerText =
+        JSON.stringify(
+            d,
+            null,
+            2
+        );
+
+
+    setTimeout(
+        refreshStatus,
+        2000
+    );
+
+}
+
+
+
+async function showLogs(service) {
+
+    const r =
+        await fetch(
+            '/api/logs/' + service
+        );
+
+
+    const d =
+        await r.json();
+
+
+    document.getElementById(
+        'logs'
+    ).innerText =
+        d.logs;
+
+}
+
+
+
+refreshStatus();
+
+loadSettings();
+
+setInterval(
+    refreshStatus,
+    5000
+);
+
+
+</script>
+
+</body>
+</html>
+"""
